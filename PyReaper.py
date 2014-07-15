@@ -21,7 +21,7 @@
 ####get_tracks(selected=True)
 ####gradient(listOfItemsOrTracks, colorA, colorB)
 
-
+from reaper_python import *
 from math import log
 
 def msg(m):
@@ -36,7 +36,36 @@ def time_to_beats(f):
     decimal = int(round(beat_tuple[0]-(beats-1), 2)*100)
     return (bars, beats, decimal)
 
+class GenericLister(object):
+    def __init__(self, count_f, get_f, const_args, contains_attr, cls):
+        self.count_f = count_f
+        self.get_f = get_f
+        self.const_args = const_args
+        self.contains_attr = contains_attr
+        self.cls = cls
 
+    def __len__(self):
+        return self.count_f(*self.const_args)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            if key < 0 or key > self.__len__()-1:
+                raise IndexError()
+            else:
+                return self.cls(*self.get_f(*(self.const_args + [key])))
+        elif isinstance(key, slice):
+            ret = list()
+            for i in xrange(key.start or 0, key.stop or self.__len__(), key.step or 1):
+                ret.append(self.cls(*self.get_f(*(self.const_args + [key]))))
+            return ret
+        else:
+            raise TypeError()
+
+    #def __iter__():
+    #    pass
+
+    def __contains__(self, item):
+        return bool(getattr(item, self.contains_attr))
 
 class ReaperProject(object):
     def __init__(self, project_number=0):
@@ -44,10 +73,52 @@ class ReaperProject(object):
         #globalize this
         self.project_number = project_number
 
+        self.selected_tracks = GenericLister(RPR_CountSelectedTracks, lambda *args: (self, RPR_GetSelectedTrack(*args)), [project_number], 'selected', ReaperTrack)
+        self.all_tracks = GenericLister(RPR_CountTracks, lambda *args: (self, RPR_GetTrack(*args)), [project_number], '', ReaperTrack) # FIXME: contains?
+        marker_count = lambda p: RPR_CountProjectMarkers(p)[0]
+        self.markers = GenericLister(marker_count, RPR_EnumProjectMarkers2, [project_number], '', ReaperMarker)
 
+    @property
+    def time_range(self):
+        return RPR_GetSet_LoopTimeRange2(self.project_number, False, False, 0., 0., False)[3:5]
+
+    @time_range.setter
+    def time_range(self, time_range):
+        return RPR_GetSet_LoopTimeRange2(self.project_number, True, False, time_range[0], time_range[1], False)
+
+    @property
+    def loop(self):
+        return RPR_GetSet_LoopTimeRange2(self.project_number, False, True, 0., 0., False)[3:5]
+
+    @loop.setter
+    def loop(self, time_range):
+        return RPR_GetSet_LoopTimeRange2(self.project_number, True, True, time_range[0], time_range[1], False)
+
+    # def get_all_tracks():
+    #     tracks = []
+    #     for i in range(RPR_CountTracks(0)):
+    #         tracks.append(ReaperTrack(RPR_GetTrack(0, i)))
+    #     return tracks
+
+    # def get_selected_tracks():
+    #     tracks = []
+    #     for i in range(RPR_CountSelectedTracks(0)):
+    #         tracks.append(ReaperTrack(RPR_GetSelectedTrack(0, i)))
+    #     return tracks
+
+class ReaperMarker(object):
+    def __init__(self, id, is_region, pos, pos_end, name, index):
+        self.id = id
+        self.is_region = is_region
+        self.position = pos
+        self.position_end = pos_end
+        self.name = name
+        self.index = index
 
 class ReaperMediaItem(object):
-    def __init__(self, id):
+    def __init__(self, project, track, id):
+        self.project = project
+        self.track = track
         self.id = id
 
 
@@ -90,7 +161,7 @@ class ReaperMediaItem(object):
 
     @position.setter
     def position(self, l):
-        RPR_GetMediaItemInfo_Value(self.id, 'D_POSITION', l)
+        RPR_SetMediaItemInfo_Value(self.id, 'D_POSITION', l)
 
 
     @property
@@ -99,26 +170,49 @@ class ReaperMediaItem(object):
 
     @length.setter
     def length(self, l):
-        RPR_GetMediaItemInfo_Value(self.id, 'D_LENGTH', l)
+        RPR_SetMediaItemInfo_Value(self.id, 'D_LENGTH', l)
+
+    @property
+    def end(self):
+        return self.position + self.length
+
+    #selection
+    @property
+    def selected(self):
+        return bool(RPR_IsMediaItemSelected(self.id))
+
+    @selected.setter
+    def selected(self, value):
+        RPR_SetMediaItemSelected(self.id, 1 if value else 0)
 
 
 
 class ReaperFX(object):
     def __init__(self):
+        pass
 
 
 
 class ReaperTrack(object):
-    def __init__(self, id):
+    def __init__(self, project, id):
+        self.project = project
         self.id = id
-        #self.media_items = []
 
-    def get_all_media_items(self):
-        media_items = []
-        num_items = RPR_GetTrackNumMediaItems(self.id)
-        for item in range(num_items):
-            media_items.append(ReaperMediaItem(RPR_GetTrackMediaItem(self.id, item)))
-        return media_items
+        self.items = GenericLister(RPR_GetTrackNumMediaItems, lambda *args: (project, self, RPR_GetTrackMediaItem(*args)), [id], '', ReaperMediaItem) # FIXME: contains?
+
+    #def get_all_media_items(self):
+    #    media_items = []
+    #    num_items = RPR_GetTrackNumMediaItems(self.id)
+    #    for item in range(num_items):
+    #        media_items.append(ReaperMediaItem(RPR_GetTrackMediaItem(self.id, item)))
+    #    return media_items
+
+    @property
+    def items_in_time_range(self):
+        loop = self.project.time_range
+        for item in self.items:
+            if item.position >= loop[0] and item.position+item.length <= loop[1]:
+                yield item
 
     @property
     def number(self):
@@ -298,10 +392,7 @@ class ReaperTrack(object):
     @property
     def selected(self):
         flag = RPR_GetTrackState(self.id, 0)[2]
-        if flag & 2:
-            return True
-        else:
-            return False
+        return bool(flag & 2)
 
     @selected.setter
     def selected(self, value):
@@ -317,35 +408,25 @@ class ReaperTrack(object):
 
 
 
-def get_all_tracks():
-    tracks = []
-    for i in range(RPR_CountTracks(0)):
-        tracks.append(ReaperTrack(RPR_GetTrack(0, i)))
-    return tracks
-
-def get_selected_tracks():
-    tracks = []
-    for i in range(RPR_CountSelectedTracks(0)):
-        tracks.append(ReaperTrack(RPR_GetSelectedTrack(0, i)))
-    return tracks
 
 
 
 
 
 
-for track in get_all_tracks():
+
+#for track in get_all_tracks():
     #track.phase_invert = True
     #track.record_monitor = 2
     #track.fx_enabled = True
     #track.record_arm = True
     #track.db = track.db -0.5
     #track.color = '#000000'
-    media_items = track.get_all_media_items()
-    if media_items:
-        for item in media_items:
-            for take in item.get_all_takes():
-                msg(take)
+    #media_items = track.get_all_media_items()
+    #f media_items:
+      #  for item in media_items:
+       #     for take in item.get_all_takes():
+        #        msg(take)
 
         #track.color = (100,100,100)
         #track.db = 0
