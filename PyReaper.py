@@ -22,6 +22,7 @@
 ####gradient(listOfItemsOrTracks, colorA, colorB)
 
 from reaper_python import *
+from sws_python import *
 from math import log
 
 def msg(m):
@@ -36,13 +37,27 @@ def time_to_beats(f):
     decimal = int(round(beat_tuple[0]-(beats-1), 2)*100)
     return (bars, beats, decimal)
 
+# use for get functions used in GenericListers
+def supports_slice(func):
+    func.supports_slice = True
+    return func
+
 class GenericLister(object):
-    def __init__(self, count_f, get_f, const_args, contains_attr, cls):
+    def __init__(self, cls, count_f, get_f, const_args=[], contains_attr=None):
+        self.cls = cls
         self.count_f = count_f
         self.get_f = get_f
         self.const_args = const_args
         self.contains_attr = contains_attr
-        self.cls = cls
+        # assign after __init__ for further customization
+        self.instance_args = []
+
+    def _inst(self, key, vals=None):
+        if vals is None:
+            vals = self.get_f(*(self.const_args + [key]))
+        args = list(self.instance_args)
+        args.extend(vals)
+        return self.cls(*args)
 
     def __len__(self):
         return self.count_f(*self.const_args)
@@ -52,75 +67,161 @@ class GenericLister(object):
             if key < 0 or key > self.__len__()-1:
                 raise IndexError()
             else:
-                return self.cls(*self.get_f(*(self.const_args + [key])))
+                return self._inst(key)
         elif isinstance(key, slice):
+            if getattr(self.get_f, 'supports_slice', False):
+                # forward to get function if it supports slices
+                return [self._inst(-1, vals) for vals in self.get_f(*(self.const_args + [key]))]
             ret = list()
             for i in xrange(key.start or 0, key.stop or self.__len__(), key.step or 1):
-                ret.append(self.cls(*self.get_f(*(self.const_args + [key]))))
+                ret.append(self._inst(i))
             return ret
         else:
             raise TypeError()
 
-    #def __iter__():
-    #    pass
-
     def __contains__(self, item):
-        return bool(getattr(item, self.contains_attr))
+        if getattr(self.contains_attr, '__call__'):
+            return self.coontains_attr(item)
+        elif isinstance(self.contains_attr, basestring):
+            return bool(getattr(item, self.contains_attr))
+        else:
+            # if no 'contains' check was provided, we have worst case scenario
+            # and check every single record until we find it
+            for obj in self:
+                if obj == item:
+                    return True
+            return False
 
-class ReaperProject(object):
-    def __init__(self, project_number=0):
-        #set project 0 as default
-        #globalize this
-        self.project_number = project_number
+class GenericObject(object):
+    def __eq__(self, other):
+        return type(self) == type(other) and self.id == other.id
 
-        self.selected_tracks = GenericLister(RPR_CountSelectedTracks, lambda *args: (self, RPR_GetSelectedTrack(*args)), [project_number], 'selected', ReaperTrack)
-        self.all_tracks = GenericLister(RPR_CountTracks, lambda *args: (self, RPR_GetTrack(*args)), [project_number], '', ReaperTrack) # FIXME: contains?
-        marker_count = lambda p: RPR_CountProjectMarkers(p)[0]
-        self.markers = GenericLister(marker_count, RPR_EnumProjectMarkers2, [project_number], '', ReaperMarker)
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+class ReaperProject(GenericObject):
+    def __init__(self, id=0):
+        self.id = id
+
+        track_in_prj = lambda t: t.project.id == id
+        get_sel_track = lambda *args: (self, RPR_GetSelectedTrack(*args))
+        self.selected_tracks = GenericLister(ReaperTrack, RPR_CountSelectedTracks, RPR_GetSelectedTrack, [id], lambda t: track_in_prj(t) and track.selected)
+        self.selected_tracks.instance_args = [self]
+        self.all_tracks = GenericLister(ReaperTrack, RPR_CountTracks, RPR_GetTrack, [id], track_in_prj)
+        self.all_tracks.instance_args = [self]
+
+        self.markers = GenericLister(ReaperMarker, self._count_markers, self._get_marker, [0])
+        self.markers.instance_args = [self]
+        self.simple_markers = GenericLister(ReaperMarker, self._count_markers, self._get_marker, [1])
+        self.simple_markers.instance_args = [self]
+        self.regions = GenericLister(ReaperMarker, self._count_markers, self._get_marker, [2])
+        self.regions.instance_args = [self]
+
+    ### marker_type = 0 (all), 1 (simple), 2 (region)
+    def _count_markers(self, marker_type=0):
+        i = marker_type + 1 if marker_type > 0 else 0
+        return RPR_CountProjectMarkers(self.id, 0, 0)[i]
+
+    @supports_slice
+    def _get_marker(self, marker_type, id):
+        if isinstance(id, int):
+            for i in range(self._count_markers()):
+                marker = RPR_EnumProjectMarkers3(self.id, i, False, 0., 0., '', 0, 0)
+                if  marker[7] == id + 1 and (marker_type == 0 or marker[3] == marker_type - 1):
+                    return marker
+            raise IndexError()
+        elif isinstance(id, slice): # TODO: this is still unused, need to 
+            indexes = range(id.start or 0, id.stop or self._count_markers(marker_type), id.step or 1)
+            ret = list()
+            for i in range(self._count_markers()):
+                marker = RPR_EnumProjectMarkers3(self.id, i, False, 0., 0., '', 0, 0)
+                if marker[7] == indexes[0] + 1 and (marker_type == 0 or marker[3] == marker_type - 1):
+                    del indexes[0]
+                    ret.append(marker)
+                if len(indexes) == 0:
+                    break
+            if len(indexes) > 0:
+                raise IndexError()
+            return ret
+        else:
+            raise TypeError()
 
     @property
     def time_range(self):
-        return RPR_GetSet_LoopTimeRange2(self.project_number, False, False, 0., 0., False)[3:5]
+        return RPR_GetSet_LoopTimeRange2(self.id, False, False, 0., 0., False)[3:5]
 
     @time_range.setter
     def time_range(self, time_range):
-        return RPR_GetSet_LoopTimeRange2(self.project_number, True, False, time_range[0], time_range[1], False)
+        return RPR_GetSet_LoopTimeRange2(self.id, True, False, time_range[0], time_range[1], False)
 
     @property
     def loop(self):
-        return RPR_GetSet_LoopTimeRange2(self.project_number, False, True, 0., 0., False)[3:5]
+        return RPR_GetSet_LoopTimeRange2(self.id, False, True, 0., 0., False)[3:5]
 
     @loop.setter
     def loop(self, time_range):
-        return RPR_GetSet_LoopTimeRange2(self.project_number, True, True, time_range[0], time_range[1], False)
+        return RPR_GetSet_LoopTimeRange2(self.id, True, True, time_range[0], time_range[1], False)
 
-    # def get_all_tracks():
-    #     tracks = []
-    #     for i in range(RPR_CountTracks(0)):
-    #         tracks.append(ReaperTrack(RPR_GetTrack(0, i)))
-    #     return tracks
 
-    # def get_selected_tracks():
-    #     tracks = []
-    #     for i in range(RPR_CountSelectedTracks(0)):
-    #         tracks.append(ReaperTrack(RPR_GetSelectedTrack(0, i)))
-    #     return tracks
 
-class ReaperMarker(object):
-    def __init__(self, id, is_region, pos, pos_end, name, index):
-        self.id = id
-        self.is_region = is_region
-        self.position = pos
-        self.position_end = pos_end
-        self.name = name
+class ReaperMarker(GenericObject):
+    def __init__(self, prj, global_index, project_num, idx, is_rgn, pos, pos_end, blackhole, index, color):
+        self.project = prj
+        self.id = global_index - 1
+        self.is_region = bool(is_rgn)
+        self._pos = pos
+        self._pos_end = pos_end
         self.index = index
+        self.color = color
 
-class ReaperMediaItem(object):
+    def __eq__(self, other):
+        add_check = self.project == other.project
+        return super(self, GenericObject).__eq__(other) and add_check
+
+    @property
+    def name(self):
+        fast_str = SNM_CreateFastString('')
+        SNM_GetProjectMarkerName(self.project.id, self.index, self.is_region, fast_str)
+        ret = SNM_GetFastString(fast_str)
+        SNM_DeleteFastString(fast_str)
+        return ret
+
+    @name.setter
+    def name(self, name):
+        pass # not implemented yet
+
+    def __repr__(self):
+        args = [self.id, self.name, self.position, self.end or '']
+        if args[-1]:
+            args[-1] = '-' + str(args[-1])
+        return '{0}: {1} ({2}{3})'.format(*args)
+
+    @property
+    def position(self):
+        return self._pos
+
+    @position.setter
+    def position(self, pos):
+        pass # not implemented
+
+    @property
+    def end(self):
+        return self._pos_end
+
+    @end.setter
+    def end(self, pos_end):
+        pass # not implemented
+
+
+class ReaperMediaItem(GenericObject):
     def __init__(self, project, track, id):
         self.project = project
         self.track = track
         self.id = id
 
+    def __eq__(self, other):
+        add_check = self.project == other.project and self.track == other.track
+        return super(self, GenericObject).__eq__(other) and add_check
 
     def get_all_takes(self):
         takes = []
@@ -193,12 +294,16 @@ class ReaperFX(object):
 
 
 
-class ReaperTrack(object):
+class ReaperTrack(GenericObject):
     def __init__(self, project, id):
         self.project = project
         self.id = id
 
-        self.items = GenericLister(RPR_GetTrackNumMediaItems, lambda *args: (project, self, RPR_GetTrackMediaItem(*args)), [id], '', ReaperMediaItem) # FIXME: contains?
+        self.items = GenericLister(ReaperMediaItem, RPR_GetTrackNumMediaItems, lambda *args: (project, self, RPR_GetTrackMediaItem(*args)), [id]) # FIXME: contains?
+
+    def __eq__(self, other):
+        add_check = self.project == other.project
+        return add_check and super(self, GenericObject).__eq__(other)
 
     #def get_all_media_items(self):
     #    media_items = []
