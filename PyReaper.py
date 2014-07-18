@@ -1,26 +1,3 @@
-#RPR_APITest()
-
-#PyReaper v0.00002
-#by Brent Elliott
-
-
-#ReaperProject
-##get_all_tracks
-##get_all_media_items
-##get_all_takes
-
-#ReaperTrack
-##get_all_children
-##get_all_media_items
-#ReaperFX
-
-
-##ReaperMediaItem
-##ReaperTake
-
-####get_tracks(selected=True)
-####gradient(listOfItemsOrTracks, colorA, colorB)
-
 from reaper_python import *
 from sws_python import *
 from math import log
@@ -56,6 +33,8 @@ class GenericLister(object):
         if vals is None:
             vals = self.get_f(*(self.const_args + [key]))
         args = list(self.instance_args)
+        if not isinstance(vals, tuple): # let's not get fooled by other iterable types (like string)
+            vals = (vals,)
         args.extend(vals)
         return self.cls(*args)
 
@@ -130,7 +109,7 @@ class ReaperProject(GenericObject):
                 if  marker[7] == id + 1 and (marker_type == 0 or marker[3] == marker_type - 1):
                     return marker
             raise IndexError()
-        elif isinstance(id, slice): # TODO: this is still unused, need to 
+        elif isinstance(id, slice):
             indexes = range(id.start or 0, id.stop or self._count_markers(marker_type), id.step or 1)
             ret = list()
             for i in range(self._count_markers()):
@@ -145,6 +124,12 @@ class ReaperProject(GenericObject):
             return ret
         else:
             raise TypeError()
+
+    def create_marker(self, position, name, color=0, wantidx=-1):
+        return ReaperMarker._create(self, False, position, 0., name, color, wantidx)
+
+    def create_region(self, position, end, name, color=0, wantidx=-1):
+        return ReaperMarker._create(self, True, position, end, name, color, wantidx)
 
     @property
     def time_range(self):
@@ -165,7 +150,7 @@ class ReaperProject(GenericObject):
 
 
 class ReaperMarker(GenericObject):
-    def __init__(self, prj, global_index, project_num, idx, is_rgn, pos, pos_end, blackhole, index, color):
+    def __init__(self, prj, global_index, blackhole, blackhole1, is_rgn, pos, pos_end, blackhole2, index, color, name=None):
         self.project = prj
         self.id = global_index - 1
         self.is_region = bool(is_rgn)
@@ -173,18 +158,30 @@ class ReaperMarker(GenericObject):
         self._pos_end = pos_end
         self.index = index
         self.color = color
+        self._name = name
 
     def __eq__(self, other):
         add_check = self.project == other.project
         return super(self, GenericObject).__eq__(other) and add_check
 
+    @classmethod
+    def _create(cls, project, is_rgn, position, end, name, color, wantidx):
+        index = RPR_AddProjectMarker2(project.id, is_rgn, position, end, name, wantidx, color)
+        if index == -1:
+            raise Exception("Could not add marker")
+        return cls(project, index, None, None, is_rgn, position, end, None, None, color, name) # FIXME: unable to get index (among markers of same type) at this point (search?)
+
     @property
     def name(self):
+        if self._name is not None:
+            return self._name
+        if self.index is None:
+            raise Exception("No index provided")
         fast_str = SNM_CreateFastString('')
         SNM_GetProjectMarkerName(self.project.id, self.index, self.is_region, fast_str)
-        ret = SNM_GetFastString(fast_str)
+        self._name = SNM_GetFastString(fast_str)
         SNM_DeleteFastString(fast_str)
-        return ret
+        return self._name
 
     @name.setter
     def name(self, name):
@@ -243,8 +240,6 @@ class ReaperMediaItem(GenericObject):
             RPR_SetMediaItemInfo_Value(self.id, 'B_MUTE', 1.0)
         else:
             RPR_SetMediaItemInfo_Value(self.id, 'B_MUTE', 0.0)
-
-
 
 
     @property
@@ -312,9 +307,12 @@ class ReaperTrack(GenericObject):
     #        media_items.append(ReaperMediaItem(RPR_GetTrackMediaItem(self.id, item)))
     #    return media_items
 
-    @property
-    def items_in_time_range(self):
-        loop = self.project.time_range
+    # uses time selection in Reaper if range_begin and range_end not specified
+    def items_in_time_range(self, range_begin=None, range_end=None):
+        if range_begin and range_end:
+            loop = (range_begin, range_end)
+        else:
+            loop = self.project.time_range
         for item in self.items:
             if item.position >= loop[0] and item.position+item.length <= loop[1]:
                 yield item
@@ -333,8 +331,6 @@ class ReaperTrack(GenericObject):
         RPR_SetMediaTrackInfo_Value(self.id, 'D_VOL', value)
 
 
-
-
     #db getter and setter
     @property
     def db(self):
@@ -347,8 +343,6 @@ class ReaperTrack(GenericObject):
         RPR_SetMediaTrackInfo_Value(self.id, 'D_VOL', volume)
 
 
-
-
     #pan getter and setter
     @property
     def pan(self):
@@ -357,8 +351,6 @@ class ReaperTrack(GenericObject):
     @pan.setter
     def pan(self, value):
         RPR_SetMediaTrackInfo_Value(self.id, 'D_PAN', value)
-
-
 
 
     #mute
@@ -375,8 +367,6 @@ class ReaperTrack(GenericObject):
             RPR_SetMediaTrackInfo_Value(self.id, 'B_MUTE', 1.0)
         else:
             RPR_SetMediaTrackInfo_Value(self.id, 'B_MUTE', 0.0)
-
-
 
 
     #solo property
@@ -398,8 +388,6 @@ class ReaperTrack(GenericObject):
         RPR_SetMediaTrackInfo_Value(self.id, 'I_SOLO', value)
 
 
-
-
     #phase_invert
     @property
     def phase_invert(self):
@@ -416,8 +404,6 @@ class ReaperTrack(GenericObject):
             RPR_SetMediaTrackInfo_Value(self.id, 'B_PHASE', 0.0)
 
 
-
-
     @property
     def record_monitor(self):
         return int(RPR_GetMediaTrackInfo_Value(self.id, 'I_RECMON'))
@@ -425,8 +411,6 @@ class ReaperTrack(GenericObject):
     @record_monitor.setter
     def record_monitor(self, value):
         RPR_SetMediaTrackInfo_Value(self.id, 'I_RECMON', value)
-
-
 
 
     @property
@@ -442,8 +426,6 @@ class ReaperTrack(GenericObject):
             RPR_SetMediaTrackInfo_Value(self.id, 'I_FXEN', 1.0)
         else:
             RPR_SetMediaTrackInfo_Value(self.id, 'I_FXEN', 0.0)
-
-
 
 
     @property
@@ -472,8 +454,6 @@ class ReaperTrack(GenericObject):
         RPR_GetSetMediaTrackInfo_String(self.id, "P_NAME", value, True)
 
 
-
-
     #color getter and setter
     @property
     def color(self):
@@ -491,8 +471,6 @@ class ReaperTrack(GenericObject):
             raise TypeError
 
 
-
-
     #selection
     @property
     def selected(self):
@@ -505,42 +483,3 @@ class ReaperTrack(GenericObject):
             RPR_SetTrackSelected(self.id, 1)
         else:
             RPR_SetTrackSelected(self.id, 0)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#for track in get_all_tracks():
-    #track.phase_invert = True
-    #track.record_monitor = 2
-    #track.fx_enabled = True
-    #track.record_arm = True
-    #track.db = track.db -0.5
-    #track.color = '#000000'
-    #media_items = track.get_all_media_items()
-    #f media_items:
-      #  for item in media_items:
-       #     for take in item.get_all_takes():
-        #        msg(take)
-
-        #track.color = (100,100,100)
-        #track.db = 0
-        #track.pan = -0.1
-        #msg(track.phase_reverse)
-        #msg(track.phase_reverse)
-    #if track.name.startswith('dick'):
-    #    msg(track.volume)
-    #track.solo = 0
-    #track.get_media_items()
-    #for each in track.media_items:
-    #   msg(time_to_beats(each.position))
