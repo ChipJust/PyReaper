@@ -19,15 +19,54 @@ def supports_slice(func):
     func.supports_slice = True
     return func
 
+# GenericLister: lazy iteration and indexing for (almost) any sorted list in reaper
 class GenericLister(object):
-    def __init__(self, cls, count_f, get_f, const_args=[], contains_attr=None):
+    def __init__(self, cls, count_f, get_f, const_args=[], contains_check=None):
         self.cls = cls
         self.count_f = count_f
         self.get_f = get_f
         self.const_args = const_args
-        self.contains_attr = contains_attr
+        self.contains_check = contains_check
         # assign after __init__ for further customization
         self.instance_args = []
+        self.limits = None # use _set_limits
+        self.steps = None # use _set_limits
+
+    def clone(self, insert_args=[]):
+        args = [self.cls, self.count_f, self.get_f, self.const_args, self.contains_check]
+        for ins_arg in reversed(insert_args):
+            args.insert(0, ins_arg)
+        new = self.__class__(*args)
+        new.instance_args = self.instance_args
+        new.limits = self.limits
+        new.steps = self.steps
+        return new
+
+    def _set_limits(self, limit_slice):
+        # first let's normalize slice start and stop to non-negative values
+        # use slice as a list since slice attributes are readonly
+        new_slice=[limit_slice.start, limit_slice.stop, limit_slice.step]
+        if new_slice[0] and new_slice[0] < 0:
+            new_slice[0] = self.__len__()+new_slice[0]
+        if new_slice[1] and new_slice[1] < 0:
+            new_slice[1] = self.__len__()+new_slice[1]
+        # if steps are already set, let's transform them according to new slice
+        if self.steps is not None:
+            if new_slice[2]:
+                current_steps = list(self.steps[new_slice[0]:new_slice[1]])
+                self.steps = current_steps[::new_slice[2]]
+            else:
+                self.steps = None # reset for later assignment
+        # if limits are already set, let's absolutize supplied limits
+        if self.limits is not None:
+            if self.limits.start:
+                new_slice[0] = self.limits.start + (new_slice[0] or 0)
+            if self.limits.stop:
+                diff = self.limits.stop - (new_slice[1] or 0)
+                new_slice[1] = new_slice[1] - diff
+        if self.steps is None:
+            self.steps = xrange(new_slice[0] or 0, new_slice[1] or self._real_length(), new_slice[2] or 1)
+        self.limits = slice(*new_slice)
 
     def _inst(self, key, vals=None):
         if vals is None:
@@ -38,38 +77,142 @@ class GenericLister(object):
         args.extend(vals)
         return self.cls(*args)
 
-    def __len__(self):
+    # return length of actual items we are operating on
+    def _real_length(self):
         return self.count_f(*self.const_args)
+
+    # return length limited by self.limits and self.steps
+    def __len__(self):
+        if self.limits is not None:
+            return len(self.steps)
+        return self._real_length()
+
+    #def __iter__(self):
+    #    pass
 
     def __getitem__(self, key):
         if isinstance(key, int):
+            if key < 0:
+                key = self.__len__() + key
             if key < 0 or key > self.__len__()-1:
-                raise IndexError()
+                raise IndexError('array index {0} out of range (0, {1})'.format(key, self.__len__()-1))
             else:
-                return self._inst(key)
+                real_key = self.steps and self.steps[key] or key
+                return self._inst(real_key)
         elif isinstance(key, slice):
-            if getattr(self.get_f, 'supports_slice', False):
-                # forward to get function if it supports slices
-                return [self._inst(-1, vals) for vals in self.get_f(*(self.const_args + [key]))]
-            ret = list()
-            for i in xrange(key.start or 0, key.stop or self.__len__(), key.step or 1):
-                ret.append(self._inst(i))
-            return ret
+            clone = self.clone()
+            clone._set_limits(key)
+            return clone
+            #msg(key) # FIXME: do clone() and _set_limits() on new instance, return new instance
+            #if getattr(self.get_f, 'supports_slice', False):
+            #    # forward to get function if it supports slices
+            #    return [self._inst(-1, vals) for vals in self.get_f(*(self.const_args + [key]))]
+            #ret = list()
+            #for i in xrange(key.start or 0, key.stop or self.__len__(), key.step or 1):
+            #    ret.append(self._inst(i))
+            #return ret
         else:
-            raise TypeError()
+            raise TypeError('key of type {0} is not supported'.format(type(key)))
 
     def __contains__(self, item):
-        if getattr(self.contains_attr, '__call__'):
-            return self.coontains_attr(item)
-        elif isinstance(self.contains_attr, basestring):
-            return bool(getattr(item, self.contains_attr))
-        else:
-            # if no 'contains' check was provided, we have worst case scenario
-            # and check every single record until we find it
-            for obj in self:
-                if obj == item:
-                    return True
-            return False
+        if self.limits is None:
+            if getattr(self.contains_check, '__call__'):
+                return self.coontains_attr(item)
+            elif isinstance(self.contains_check, basestring):
+                return bool(getattr(item, self.contains_check))
+        # if no 'contains' check was provided or limits are set
+        # then we have worst case scenario
+        # and check every single record until we find it
+        for obj in self:
+            if obj == item:
+                return True
+        return False
+
+# GenericTimelineLister: lazy binary search based iteration and indexing for (almost) any sorted time based lists in Reaper
+class GenericTimelineLister(GenericLister):
+    def __init__(self, pos_attr, *args, **kwargs):
+        self.pos_attr = pos_attr
+        super(GenericTimelineLister, self).__init__(*args, **kwargs)
+
+    def clone(self):
+        return super(GenericTimelineLister, self).clone([self.pos_attr])
+
+    def _bisect(self, key, comp_func):
+        if isinstance(key, basestring):
+            pass # convert bars.beats representation to normal time representation (float)
+        if isinstance(key, float):
+            # this search algorithm is equivalent to bisect_left
+            if key < 0:
+                raise IndexError('time must be non-negative')
+            lo = 0
+            hi = self.__len__()
+            while lo < hi:
+                mid = (lo+hi)//2
+                (lo, hi) = comp_func(lo, mid, hi)
+            return lo
+        return None
+
+    def _get_left(self, key):
+        def f(lo, mid, hi):
+            if getattr(self[mid], self.pos_attr) < key: lo = mid+1
+            else: hi = mid
+            return (lo, hi)
+        return self._bisect(key, f)
+
+    def _get_right(self, key):
+        def f(lo, mid, hi):
+            if key < getattr(self[mid], self.pos_attr): hi = mid
+            else: lo = mid+1
+            return (lo, hi)
+        return self._bisect(key, f)
+
+    # def _get_left(self, key):
+    #     if isinstance(key, basestring):
+    #         pass # convert bars.beats representation to normal time representation (float)
+    #     if isinstance(key, float):
+    #         # this search algorithm is equivalent to bisect_left
+    #         if key < 0:
+    #             raise IndexError('time must be non-negative')
+    #         lo = 0
+    #         hi = self.__len__()
+    #         while lo < hi:
+    #             mid = (lo+hi)//2
+    #             if getattr(self[mid], self.pos_attr) < key: lo = mid+1
+    #             else: hi = mid
+    #         return lo
+    #     return None
+
+    # def _get_right(self, key):
+    #     if isinstance(key, basestring):
+    #         pass # convert bars.beats representation to normal time representation (float)
+    #     if isinstance(key, float):
+    #         # this search algorithm is equivalent to bisect_right
+    #         if key < 0:
+    #             raise IndexError('time must be non-negative')
+    #         lo = 0
+    #         hi = self.__len__()
+    #         while lo < hi:
+    #             mid = (lo+hi)//2
+    #             if key < getattr(self[mid], self.pos_attr): hi = mid
+    #             else: lo = mid+1
+    #         return lo # if position of last item is after 'key', then lo=hi=len(self) which will raise IndexError
+    #     return None
+
+    def __getitem__(self, key):
+        if isinstance(key, basestring) or isinstance(key, float):
+            return self[self._get_right(key)]
+        if isinstance(key, slice):
+            if key.start and isinstance(key.start, float) or key.stop and isinstance(key.stop, float):
+                # convert slice start/stop to normal indexes
+                new_slice = [key.start, key.stop, key.step] # slice attrs are readonly
+                if new_slice[0]: new_slice[0] = self._get_right(new_slice[0])
+                if new_slice[1]: new_slice[1] = self._get_left(new_slice[1])
+                if new_slice[2]:
+                    raise TypeError('step part of slice is not supported when slicing by positions in time')
+                key = slice(*new_slice)
+                # continue to super().__getitem__
+        return super(GenericTimelineLister, self).__getitem__(key)
+
 
 class GenericObject(object):
     def __eq__(self, other):
@@ -78,12 +221,71 @@ class GenericObject(object):
     def __ne__(self, other):
         return not self.__eq__(other)
 
+class MarkerList(object):
+    def __init__(self, project):
+        self.project = project
+        self._marker_map = None
+        self._marker_store = None
+
+    ### marker_type = 0 (all), 1 (simple), 2 (region)
+    def _count_markers(self, marker_type=0):
+        i = marker_type + 1 if marker_type > 0 else 0
+        return RPR_CountProjectMarkers(self.project.id, 0, 0)[i]
+
+    def build_from_reaper(self):
+        if self._marker_store is None:
+            self._marker_map = list()
+            self._marker_store = dict()
+        # the following code is pretty much the same as SWS MarkerList/MarkerListClass.cpp - MarkerList::BuildFromReaper()
+        i = 0
+        while i < self._count_markers():
+            marker_data = [self.project]
+            marker_data.extend(RPR_EnumProjectMarkers3(self.project.id, i, False, 0., 0., '', 0, 0))
+            if i >= len(self._marker_map) or not self._marker_store[self._marker_map[i]].compare_by_val(*marker_data):
+                # not found, try one more ahead
+                if i+1 >= len(self._marker_map) or not self._marker_store[self._marker_map[i+1]].compare_by_val(*marker_data):
+                    # not found, assume new and insert at current position
+                    marker = ReaperMarker(*marker_data)
+                    self._marker_map.insert(i, marker.internal_index)
+                    self._marker_store[marker.internal_index] = marker
+                else:
+                    # found one ahead, the current one must have been deleted
+                    del self._marker_store[self._marker_map[i]]
+                    del self._marker_map[i]
+            i += 1
+        if i < len(self._marker_map):
+            for d in range(i, len(self._marker_map)):
+                del self._marker_store[self._marker_map[d]]
+            del self._marker_map[i:]
+
+    @property
+    def marker_store(self):
+        if self._marker_store is None:
+            self.build_from_reaper()
+        return self._marker_store
+
+    @property
+    def markers(self):
+        pass     
+
+    @property
+    def regions(self):
+        pass
+
+    @property
+    def markers_in_time(self):
+        pass
+
+    @property
+    def regions_in_time(self):
+        pass
+
+
 class ReaperProject(GenericObject):
     def __init__(self, id=0):
         self.id = id
 
         track_in_prj = lambda t: t.project.id == id
-        get_sel_track = lambda *args: (self, RPR_GetSelectedTrack(*args))
         self.selected_tracks = GenericLister(ReaperTrack, RPR_CountSelectedTracks, RPR_GetSelectedTrack, [id], lambda t: track_in_prj(t) and track.selected)
         self.selected_tracks.instance_args = [self]
         self.all_tracks = GenericLister(ReaperTrack, RPR_CountTracks, RPR_GetTrack, [id], track_in_prj)
@@ -109,19 +311,19 @@ class ReaperProject(GenericObject):
                 if  marker[7] == id + 1 and (marker_type == 0 or marker[3] == marker_type - 1):
                     return marker
             raise IndexError()
-        elif isinstance(id, slice):
-            indexes = range(id.start or 0, id.stop or self._count_markers(marker_type), id.step or 1)
-            ret = list()
-            for i in range(self._count_markers()):
-                marker = RPR_EnumProjectMarkers3(self.id, i, False, 0., 0., '', 0, 0)
-                if marker[7] == indexes[0] + 1 and (marker_type == 0 or marker[3] == marker_type - 1):
-                    del indexes[0]
-                    ret.append(marker)
-                if len(indexes) == 0:
-                    break
-            if len(indexes) > 0:
-                raise IndexError()
-            return ret
+        #elif isinstance(id, slice):
+        #    indexes = range(id.start or 0, id.stop or self._count_markers(marker_type), id.step or 1)
+        #    ret = list()
+        #    for i in range(self._count_markers()):
+        #        marker = RPR_EnumProjectMarkers3(self.id, i, False, 0., 0., '', 0, 0)
+        #        if marker[7] == indexes[0] + 1 and (marker_type == 0 or marker[3] == marker_type - 1):
+        #            del indexes[0]
+        #            ret.append(marker)
+        #        if len(indexes) == 0:
+        #            break
+        #    if len(indexes) > 0:
+        #        raise IndexError()
+        #    return ret
         else:
             raise TypeError()
 
@@ -130,6 +332,16 @@ class ReaperProject(GenericObject):
 
     def create_region(self, position, end, name, color=0, wantidx=-1):
         return ReaperMarker._create(self, True, position, end, name, color, wantidx)
+
+    @property
+    def cursor_position(self):
+        return RPR_GetCursorPositionEx(self.id)
+
+    @cursor_position.setter
+    def cursor_position(self, value):
+        if isinstance(value, float):
+            value = (value, True, True)
+        RPR_SetEditCurPos2(self.id, *value)
 
     @property
     def time_range(self):
@@ -162,7 +374,14 @@ class ReaperMarker(GenericObject):
 
     def __eq__(self, other):
         add_check = self.project == other.project
-        return super(self, GenericObject).__eq__(other) and add_check
+        return super(ReaperMarker, self).__eq__(other) and add_check
+
+    @property
+    def internal_index(self):
+        return '{0}{1}'.format(self.index, 'r' if self.is_region else 'm')
+
+    def compare_by_val(self, *args):
+        pass
 
     @classmethod
     def _create(cls, project, is_rgn, position, end, name, color, wantidx):
@@ -218,7 +437,7 @@ class ReaperMediaItem(GenericObject):
 
     def __eq__(self, other):
         add_check = self.project == other.project and self.track == other.track
-        return super(self, GenericObject).__eq__(other) and add_check
+        return super(ReaperMediaItem, self).__eq__(other) and add_check
 
     def get_all_takes(self):
         takes = []
@@ -226,29 +445,14 @@ class ReaperMediaItem(GenericObject):
         for take in range(num_takes):
             takes.append(RPR_GetMediaItemTake(self.id, take))
         return takes
-    #mute
+    
     @property
     def mute(self):
-        if RPR_GetMediaItemInfo_Value(self.id, 'B_MUTE') == 0.0:
-            return False
-        else:
-            return True
+        return bool(RPR_GetMediaItemInfo_Value(self.id, 'B_MUTE'))
 
     @mute.setter
     def mute(self, b):
-        if b:
-            RPR_SetMediaItemInfo_Value(self.id, 'B_MUTE', 1.0)
-        else:
-            RPR_SetMediaItemInfo_Value(self.id, 'B_MUTE', 0.0)
-
-
-    @property
-    def length(self):
-        return RPR_GetMediaItemInfo_Value(self.id, 'D_LENGTH')
-
-    @length.setter
-    def length(self, l):
-        pass
+        RPR_SetMediaItemInfo_Value(self.id, 'B_MUTE', float(b))
 
 
     @property
@@ -279,7 +483,7 @@ class ReaperMediaItem(GenericObject):
 
     @selected.setter
     def selected(self, value):
-        RPR_SetMediaItemSelected(self.id, 1 if value else 0)
+        RPR_SetMediaItemSelected(self.id, int(value))
 
 
 
@@ -294,11 +498,11 @@ class ReaperTrack(GenericObject):
         self.project = project
         self.id = id
 
-        self.items = GenericLister(ReaperMediaItem, RPR_GetTrackNumMediaItems, lambda *args: (project, self, RPR_GetTrackMediaItem(*args)), [id]) # FIXME: contains?
+        self.items = GenericTimelineLister('position', ReaperMediaItem, RPR_GetTrackNumMediaItems, lambda *args: (project, self, RPR_GetTrackMediaItem(*args)), [id]) # FIXME: contains?
 
     def __eq__(self, other):
         add_check = self.project == other.project
-        return add_check and super(self, GenericObject).__eq__(other)
+        return add_check and super(ReaperTrack, self).__eq__(other)
 
     #def get_all_media_items(self):
     #    media_items = []
@@ -356,17 +560,11 @@ class ReaperTrack(GenericObject):
     #mute
     @property
     def mute(self):
-        if RPR_GetMediaTrackInfo_Value(self.id, 'B_MUTE') == 0.0:
-            return False
-        else:
-            return True
+        return bool(RPR_GetMediaTrackInfo_Value(self.id, 'B_MUTE'))
 
     @mute.setter
     def mute(self, b):
-        if b:
-            RPR_SetMediaTrackInfo_Value(self.id, 'B_MUTE', 1.0)
-        else:
-            RPR_SetMediaTrackInfo_Value(self.id, 'B_MUTE', 0.0)
+        RPR_SetMediaTrackInfo_Value(self.id, 'B_MUTE', float(b))
 
 
     #solo property
@@ -374,10 +572,7 @@ class ReaperTrack(GenericObject):
     def solo(self):
         #replace with GetMediaTrackInfo_Value
         flag = RPR_GetTrackState(self.id, 0)[2]
-        if flag & 16:
-            return True
-        else:
-            return False
+        return bool(flag & 16)
 
     @solo.setter
     def solo(self, value):
@@ -391,18 +586,11 @@ class ReaperTrack(GenericObject):
     #phase_invert
     @property
     def phase_invert(self):
-        if RPR_GetMediaTrackInfo_Value(self.id, 'B_PHASE') == 0.0:
-            return False
-        else:
-            return True
+        return bool(RPR_GetMediaTrackInfo_Value(self.id, 'B_PHASE'))
 
     @phase_invert.setter
     def phase_invert(self, value):
-        if value:
-            RPR_SetMediaTrackInfo_Value(self.id, 'B_PHASE', 1.0)
-        else:
-            RPR_SetMediaTrackInfo_Value(self.id, 'B_PHASE', 0.0)
-
+        RPR_SetMediaTrackInfo_Value(self.id, 'B_PHASE', float(bool(value)))
 
     @property
     def record_monitor(self):
@@ -415,32 +603,20 @@ class ReaperTrack(GenericObject):
 
     @property
     def fx_enabled(self):
-        if RPR_GetMediaTrackInfo_Value(self.id, 'I_FXEN') == 0.0:
-            return False
-        else:
-            return True
+        return bool(RPR_GetMediaTrackInfo_Value(self.id, 'I_FXEN'))
 
     @fx_enabled.setter
     def fx_enabled(self, value):
-        if value:
-            RPR_SetMediaTrackInfo_Value(self.id, 'I_FXEN', 1.0)
-        else:
-            RPR_SetMediaTrackInfo_Value(self.id, 'I_FXEN', 0.0)
+        RPR_SetMediaTrackInfo_Value(self.id, 'I_FXEN', float(bool(value)))
 
 
     @property
     def record_arm(self):
-        if RPR_GetMediaTrackInfo_Value(self.id, 'I_RECARM') == 0.0:
-            return False
-        else:
-            return True
+        return bool(RPR_GetMediaTrackInfo_Value(self.id, 'I_RECARM'))
 
     @record_arm.setter
     def record_arm(self, value):
-        if value:
-            RPR_SetMediaTrackInfo_Value(self.id, 'I_RECARM', 1.0)
-        else:
-            RPR_SetMediaTrackInfo_Value(self.id, 'I_RECARM', 0.0)
+        RPR_SetMediaTrackInfo_Value(self.id, 'I_RECARM', float(bool(value)))
 
 
     #name getter and setter
@@ -479,7 +655,4 @@ class ReaperTrack(GenericObject):
 
     @selected.setter
     def selected(self, value):
-        if value:
-            RPR_SetTrackSelected(self.id, 1)
-        else:
-            RPR_SetTrackSelected(self.id, 0)
+        RPR_SetTrackSelected(self.id, int(bool(value)))
