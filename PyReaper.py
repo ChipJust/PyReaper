@@ -2,6 +2,18 @@ from reaper_python import *
 from sws_python import *
 from math import log
 
+
+# TODO:
+# 1) Implement bulk functions/properties? on genericlister so that this would be possible:
+#      item_list[:100].mute = True
+# 2) Implement hybrid slices, e.g.:
+#      item_list["1.1.0":50] or item_list[:224.4:2]
+# 3) Implement lazy properties as in http://stackoverflow.com/a/3013910, e.g. (in ReaperProject):
+#      @lazyprop
+#      all_tracks(self):
+#          return GenericLister(ReaperTrack, RPR_CountTracks, RPR_GetTrack, [id], track_in_prj)
+#      # (instead of initializing in constructor)
+
 def msg(m):
     RPR_ShowConsoleMsg(m)
     RPR_ShowConsoleMsg('\n')
@@ -134,14 +146,21 @@ class GenericTimelineLister(GenericLister):
         self.pos_attr = pos_attr
         super(GenericTimelineLister, self).__init__(*args, **kwargs)
 
+    def _is_time(self, val): # FIXME: this should probably be extended and become a global function
+        return isinstance(val, float) or isinstance(val, basestring)
+
+    def _normalize_time(self, val): # FIXME: this should probably be extended and become a global function
+        if isinstance(val, basestring):
+            val = val # FIXME: convert to float representation
+        return val
+
     def clone(self):
         return super(GenericTimelineLister, self).clone([self.pos_attr])
 
     def _bisect(self, key, comp_func):
-        if isinstance(key, basestring):
-            pass # convert bars.beats representation to normal time representation (float)
-        if isinstance(key, float):
-            # this search algorithm is equivalent to bisect_left
+        if self._is_time(key):
+            key = self._normalize_time(key)
+            # this search algorithm is equivalent to bisect_left or bisect_right (depending on comp_func)
             if key < 0:
                 raise IndexError('time must be non-negative')
             lo = 0
@@ -166,49 +185,17 @@ class GenericTimelineLister(GenericLister):
             return (lo, hi)
         return self._bisect(key, f)
 
-    # def _get_left(self, key):
-    #     if isinstance(key, basestring):
-    #         pass # convert bars.beats representation to normal time representation (float)
-    #     if isinstance(key, float):
-    #         # this search algorithm is equivalent to bisect_left
-    #         if key < 0:
-    #             raise IndexError('time must be non-negative')
-    #         lo = 0
-    #         hi = self.__len__()
-    #         while lo < hi:
-    #             mid = (lo+hi)//2
-    #             if getattr(self[mid], self.pos_attr) < key: lo = mid+1
-    #             else: hi = mid
-    #         return lo
-    #     return None
-
-    # def _get_right(self, key):
-    #     if isinstance(key, basestring):
-    #         pass # convert bars.beats representation to normal time representation (float)
-    #     if isinstance(key, float):
-    #         # this search algorithm is equivalent to bisect_right
-    #         if key < 0:
-    #             raise IndexError('time must be non-negative')
-    #         lo = 0
-    #         hi = self.__len__()
-    #         while lo < hi:
-    #             mid = (lo+hi)//2
-    #             if key < getattr(self[mid], self.pos_attr): hi = mid
-    #             else: lo = mid+1
-    #         return lo # if position of last item is after 'key', then lo=hi=len(self) which will raise IndexError
-    #     return None
-
     def __getitem__(self, key):
-        if isinstance(key, basestring) or isinstance(key, float):
+        if self._is_time(key):
             return self[self._get_right(key)]
         if isinstance(key, slice):
-            if key.start and isinstance(key.start, float) or key.stop and isinstance(key.stop, float):
+            start_is_t = self._is_time(key.start)
+            stop_is_t = self._is_time(key.stop)
+            if start_is_t or stop_is_t:
                 # convert slice start/stop to normal indexes
                 new_slice = [key.start, key.stop, key.step] # slice attrs are readonly
-                if new_slice[0]: new_slice[0] = self._get_right(new_slice[0])
-                if new_slice[1]: new_slice[1] = self._get_left(new_slice[1])
-                if new_slice[2]:
-                    raise TypeError('step part of slice is not supported when slicing by positions in time')
+                if start_is_t: new_slice[0] = self._get_right(new_slice[0])
+                if stop_is_t: new_slice[1] = self._get_left(new_slice[1])
                 key = slice(*new_slice)
                 # continue to super().__getitem__
         return super(GenericTimelineLister, self).__getitem__(key)
@@ -504,23 +491,6 @@ class ReaperTrack(GenericObject):
         add_check = self.project == other.project
         return add_check and super(ReaperTrack, self).__eq__(other)
 
-    #def get_all_media_items(self):
-    #    media_items = []
-    #    num_items = RPR_GetTrackNumMediaItems(self.id)
-    #    for item in range(num_items):
-    #        media_items.append(ReaperMediaItem(RPR_GetTrackMediaItem(self.id, item)))
-    #    return media_items
-
-    # uses time selection in Reaper if range_begin and range_end not specified
-    def items_in_time_range(self, range_begin=None, range_end=None):
-        if range_begin and range_end:
-            loop = (range_begin, range_end)
-        else:
-            loop = self.project.time_range
-        for item in self.items:
-            if item.position >= loop[0] and item.position+item.length <= loop[1]:
-                yield item
-
     @property
     def number(self):
         return int(RPR_GetMediaTrackInfo_Value(self.id, 'IP_TRACKNUMBER'))
@@ -650,8 +620,7 @@ class ReaperTrack(GenericObject):
     #selection
     @property
     def selected(self):
-        flag = RPR_GetTrackState(self.id, 0)[2]
-        return bool(flag & 2)
+        return bool(RPR_IsTrackSelected(self.id))
 
     @selected.setter
     def selected(self, value):
