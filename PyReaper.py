@@ -5,7 +5,7 @@ from math import log
 
 # TODO:
 # 1) Implement bulk functions/properties? on genericlister so that this would be possible:
-#      item_list[:100].mute = True
+#      item_list[:100].mute = True # mute items from first up to 100th
 # 2) Implement hybrid slices, e.g.:
 #      item_list["1.1.0":50] or item_list[:224.4:2]
 # 3) Implement lazy properties as in http://stackoverflow.com/a/3013910, e.g. (in ReaperProject):
@@ -33,6 +33,15 @@ def supports_slice(func):
 
 # GenericLister: lazy iteration and indexing for (almost) any sorted list in reaper
 class GenericLister(object):
+    ## this encapsulates any sorted list in Reaper. Arguments should be the following:
+    ## cls: Python class for all objects in this list (e.g. ReaperTrack for items in project.tracks)
+    ## count_f: function which returns how many objects are in this list (must return non-negative integer). Receives const_args as arguments.
+    ## get_f:
+    ## const_args: list of arguments which will be passed to count_f, get_f and delete_f as first arguments
+    ## contains_check:
+    ## # additional arguments can be assigned after __init__:
+    ## instance_args:
+    ## delete_f: function which deletes objects in this list. Receives *const_args, id as arguments. 
     def __init__(self, cls, count_f, get_f, const_args=[], contains_check=None):
         self.cls = cls
         self.count_f = count_f
@@ -41,6 +50,7 @@ class GenericLister(object):
         self.contains_check = contains_check
         # assign after __init__ for further customization
         self.instance_args = []
+        self.delete_f = None # no delete func by default
         self.limits = None # use _set_limits
         self.steps = None # use _set_limits
 
@@ -53,32 +63,43 @@ class GenericLister(object):
         new.limits = self.limits
         new.steps = self.steps
         return new
-
-    def _set_limits(self, limit_slice):
-        # first let's normalize slice start and stop to non-negative values
-        # use slice as a list since slice attributes are readonly
-        new_slice=[limit_slice.start, limit_slice.stop, limit_slice.step]
-        if new_slice[0] and new_slice[0] < 0:
-            new_slice[0] = self.__len__()+new_slice[0]
-        if new_slice[1] and new_slice[1] < 0:
-            new_slice[1] = self.__len__()+new_slice[1]
-        # if steps are already set, let's transform them according to new slice
-        if self.steps is not None:
-            if new_slice[2]:
-                current_steps = list(self.steps[new_slice[0]:new_slice[1]])
-                self.steps = current_steps[::new_slice[2]]
-            else:
-                self.steps = None # reset for later assignment
-        # if limits are already set, let's absolutize supplied limits
-        if self.limits is not None:
-            if self.limits.start:
-                new_slice[0] = self.limits.start + (new_slice[0] or 0)
-            if self.limits.stop:
-                diff = self.limits.stop - (new_slice[1] or 0)
-                new_slice[1] = new_slice[1] - diff
-        if self.steps is None:
-            self.steps = xrange(new_slice[0] or 0, new_slice[1] or self._real_length(), new_slice[2] or 1)
-        self.limits = slice(*new_slice)
+    
+    def _resolve_key(self, key):
+        if isinstance(key, int):
+            if key < 0:
+                key = self.__len__() + key
+            if key < 0 or key > self.__len__()-1:
+                raise IndexError('array index {0} out of range (0, {1})'.format(key, self.__len__()-1))
+            return self.steps and self.steps[key] or key
+        if isinstance(key, slice):
+            # first let's normalize slice start and stop to non-negative values
+            # use slice as a list since slice attributes are readonly
+            new_slice=[key.start, key.stop, key.step]
+            if new_slice[0] is None:
+                new_slice[0] = 0
+            if new_slice[0] and new_slice[0] < 0:
+                new_slice[0] = self.__len__()+new_slice[0]
+            if new_slice[1] is None:
+                new_slice[1] = self.__len__()
+            if new_slice[1] and new_slice[1] < 0:
+                new_slice[1] = self.__len__()+new_slice[1]
+            # if limits are already set, let's absolutize supplied limits
+            if self.limits is not None:
+                if self.limits.start:
+                    new_slice[0] = self.limits.start + new_slice[0]
+                if self.limits.stop:
+                    diff = self.limits.stop - new_slice[1]
+                    new_slice[1] = new_slice[1] - diff
+            # if steps are already set, let's transform them according to new slice
+            new_steps = None
+            if new_slice[2] and new_slice[2] > 1:
+                if self.steps is not None:
+                    current_steps = list(self.steps[new_slice[0]:new_slice[1]])
+                    new_steps = current_steps[::new_slice[2]]
+                else:
+                    new_steps = xrange(new_slice[0], new_slice[1], new_slice[2])
+            return (new_slice, new_steps or self.steps)
+        raise TypeError('type of key is unrecognized')
 
     def _inst(self, key, vals=None):
         if vals is None:
@@ -92,28 +113,42 @@ class GenericLister(object):
     # return length of actual items we are operating on
     def _real_length(self):
         return self.count_f(*self.const_args)
+    
+    def __delitem__(self, key):
+        if self.delete_f is None:
+            raise NotImplementedError('delete functionality is not implemented on this list')
+        key = self._resolve_key(key)
+        if isinstance(key, int):
+            to_delete = (self.get_f(*(self.const_args + [key])),)
+        elif isinstance(key, tuple):
+            key_range = key[1]
+            if not key_range:
+                key_range = xrange(key[0][0] or 0, key[0][1] or self._real_length())
+            to_delete = list()
+            for i in key_range:
+                to_delete.append(self.get_f(*(self.const_args + [i]))[-1])
+        for item in to_delete:
+            self.delete_f(*(self.const_args + [item]))
 
     # return length limited by self.limits and self.steps
     def __len__(self):
         if self.limits is not None:
-            return len(self.steps)
+            if self.steps is not None:
+                return len(self.steps)
+            return self.limits[1] - self.limits[0]
         return self._real_length()
 
     #def __iter__(self):
     #    pass
 
     def __getitem__(self, key):
+        key = self._resolve_key(key)
         if isinstance(key, int):
-            if key < 0:
-                key = self.__len__() + key
-            if key < 0 or key > self.__len__()-1:
-                raise IndexError('array index {0} out of range (0, {1})'.format(key, self.__len__()-1))
-            else:
-                real_key = self.steps and self.steps[key] or key
-                return self._inst(real_key)
-        elif isinstance(key, slice):
+            return self._inst(key)
+        elif isinstance(key, tuple):
             clone = self.clone()
-            clone._set_limits(key)
+            clone.limits = slice(*key[0])
+            clone.steps = key[1]
             return clone
             #msg(key) # FIXME: do clone() and _set_limits() on new instance, return new instance
             #if getattr(self.get_f, 'supports_slice', False):
@@ -129,7 +164,7 @@ class GenericLister(object):
     def __contains__(self, item):
         if self.limits is None:
             if getattr(self.contains_check, '__call__'):
-                return self.coontains_attr(item)
+                return self.contains_check(item)
             elif isinstance(self.contains_check, basestring):
                 return bool(getattr(item, self.contains_check))
         # if no 'contains' check was provided or limits are set
@@ -184,6 +219,10 @@ class GenericTimelineLister(GenericLister):
             else: lo = mid+1
             return (lo, hi)
         return self._bisect(key, f)
+    
+    def __delitem__(self, key):
+        # TODO: if key is in time formats, resolve it no int/slice!
+        return super(GenericTimelineLister, self).__delitem__(key)
 
     def __getitem__(self, key):
         if self._is_time(key):
@@ -425,6 +464,9 @@ class ReaperMediaItem(GenericObject):
     def __eq__(self, other):
         add_check = self.project == other.project and self.track == other.track
         return super(ReaperMediaItem, self).__eq__(other) and add_check
+    
+    def delete(self):
+        RPR_DeleteTrackMediaItem(self.track, self.id)
 
     def get_all_takes(self):
         takes = []
@@ -486,6 +528,7 @@ class ReaperTrack(GenericObject):
         self.id = id
 
         self.items = GenericTimelineLister('position', ReaperMediaItem, RPR_GetTrackNumMediaItems, lambda *args: (project, self, RPR_GetTrackMediaItem(*args)), [id]) # FIXME: contains?
+        self.items.delete_f = RPR_DeleteTrackMediaItem
 
     def __eq__(self, other):
         add_check = self.project == other.project
