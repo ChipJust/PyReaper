@@ -105,6 +105,7 @@ class ReaperMediaItem(object):
 
 class ReaperFX(object):
     def __init__(self):
+        pass
 
 
 
