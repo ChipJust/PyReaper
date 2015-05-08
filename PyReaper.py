@@ -1,9 +1,3 @@
-#RPR_APITest()
-
-#PyReaper v0.00002
-#by Brent Elliott
-
-
 #ReaperProject
 ##get_all_tracks
 ##get_all_media_items
@@ -21,6 +15,7 @@
 ####get_tracks(selected=True)
 ####gradient(listOfItemsOrTracks, colorA, colorB)
 
+from reaper_python import *
 
 from math import log
 
@@ -359,3 +354,21 @@ for track in get_all_tracks():
     #track.get_media_items()
     #for each in track.media_items:
     #   msg(time_to_beats(each.position))
+
+def find_select_range():
+    """Find the time range of the selected area."""
+    SET = 1
+    GET = 0
+    LOOP = 1
+    TIMESEL = 0
+    
+    selInf = RPR_GetSet_LoopTimeRange2(0, GET, TIMESEL, 0, 0, 0)
+    RPR_ShowConsoleMsg(str(selInf)) # (   0,     0,      0,   0.0, 2.1240082129204567, 0)
+    #                                 (proj, isSet, isLoop, start,                end, allowautoseek)
+    selStart = selInf[3]
+    selEnd = selInf[4]
+    RPR_ShowConsoleMsg("\n")
+    RPR_ShowConsoleMsg('Time Selection: ' + str(selStart) + ' to ' + str(selEnd) + '\n')
+    
+    time = RPR_GetProjectTimeSignature2(0, 0, 0)
+    RPR_ShowConsoleMsg(str(time) + "\n")
