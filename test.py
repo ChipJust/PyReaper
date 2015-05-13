@@ -86,9 +86,32 @@ def show_tracks():
 
 #RPR_GetAudioAccessorEndTime -- what that do
 
+def ProjectSettings():
+    what = RPR_Main_OnCommand(40021, 0)
+    RPR_ShowConsoleMsg (str(what))
+
+def SetProjectTimeFromSelection():
+    what = RPR_Main_OnCommand(40843, 0)
+    RPR_ShowConsoleMsg (str(what))
+
+def show_chunk():
+    number_items_selected = RPR_CountSelectedMediaItems (0)
+    if number_items_selected < 1:
+        RPR_ShowConsoleMsg ("No media items selected.")
+        return
+    if number_items_selected > 1:
+        RPR_ShowConsoleMsg ("More than one media item selected.")
+        return
+    media_item = RPR_GetSelectedMediaItem (0, 0)
+    chunk = "" # Empty string means get
+    maxlen = 1024*1024 # 1MB is the max chunk size
+    (status, media_item, chunk, maxlen) = RPR_GetSetItemState(media_item, chunk, maxlen)
+    RPR_ShowConsoleMsg ("status=%s, media_item=%s, maxlen=%s\n" % (status, media_item, maxlen))
+    RPR_ShowConsoleMsg ("chunk:\n%s\n" % (chunk))
 
 def main():
-    PyReaper.find_select_range()
+    #PyReaper.find_select_range()
+    show_chunk()
     
 
 if __name__ == '__main__':

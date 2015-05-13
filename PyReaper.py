@@ -682,5 +682,24 @@ def find_select_range():
     RPR_ShowConsoleMsg("\n")
     RPR_ShowConsoleMsg('Time Selection: ' + str(selStart) + ' to ' + str(selEnd) + '\n')
     
-    time = RPR_GetProjectTimeSignature2(0, 0, 0)
-    RPR_ShowConsoleMsg(str(time) + "\n")
+    proj, bpm, bpi = RPR_GetProjectTimeSignature2(0, 0, 0)
+    # bpm is normalized to quarter notes, so if your time is x/8 the bpm will be 2x the tempo.
+    # and if your time signature is x/5 then bpm will be temp * 5/4
+    # bpi is the numerator, so 7 in 7/8
+    # so the total time in a bar is 4*bpm/60
+    # and the number of beats in a bar is always bpi
+    # so the time per beat is (4*bpm)/(60*bpi)
+    RPR_ShowConsoleMsg("proj=%d, bpm=%f, bpi=%d\n" % (proj, bpm, bpi))
+    
+    # to get the bpm needed for selection in 4/4
+    #
+    spb = selEnd - selStart # seconds per bar
+    # seconds per beat = seconds per bar / number of beats per bar = spb / 4
+    # bars per minute = bpm * number of beats per par = bpm * 4
+    number_of_beats_per_bar = 4
+    sp_beat = spb / number_of_beats_per_bar
+    # 1 minute = 60 seconds ... 1 second = 1/60 minutes
+    mpb = sp_beat / 60
+    #new_bpm = 1 / ((spb / number_of_beats_per_bar) / 60)
+    new_bpm = (60*number_of_beats_per_bar) / spb
+    RPR_ShowConsoleMsg("spb=%f, sp_beat=%f, mpb=%f, new_bpm=%f\n" % (spb, sp_beat, mpb, new_bpm))
